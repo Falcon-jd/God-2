@@ -1,0 +1,6 @@
+# Normalise line endings. The repo was built by uploading files one at a time
+# through the GitHub web UI, which stored them with CRLF; everything checked in
+# from a terminal used LF. Without this, every file looks fully rewritten in
+# every diff.
+* text=auto eol=lf
+*.png binary

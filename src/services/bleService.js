@@ -40,16 +40,19 @@ export async function connectToJacket({ onTelemetry, onDisconnect }) {
   }
 
   const device = await navigator.bluetooth.requestDevice({
-    filters: [{ services: [SERVICE_UUID] }],
-    // If your firmware advertises a device name instead of the service UUID,
-    // swap the line above for:
-    // filters: [{ namePrefix: "JUST CHILL" }],
-    // optionalServices: [SERVICE_UUID],
+    // Entries in `filters` are OR'd. Matching on the service UUID alone meant
+    // the picker was empty on any build whose advertisement packet carried the
+    // name but not the service UUID — the jacket was simply invisible with no
+    // error to explain why. Matching the name as well makes it show up either
+    // way; optionalServices is what grants access to the service once paired.
+    filters: [{ services: [SERVICE_UUID] }, { namePrefix: "JUST CHILL" }],
+    optionalServices: [SERVICE_UUID],
   });
 
-  device.addEventListener("gattserverdisconnected", () => {
+  const handleGattDisconnected = () => {
     onDisconnect && onDisconnect();
-  });
+  };
+  device.addEventListener("gattserverdisconnected", handleGattDisconnected);
 
   const server = await device.gatt.connect();
   const service = await server.getPrimaryService(SERVICE_UUID);
@@ -59,27 +62,75 @@ export async function connectToJacket({ onTelemetry, onDisconnect }) {
   await telemetryChar.startNotifications();
 
   const decoder = new TextDecoder("utf-8");
+
+  // Telemetry can arrive split across several notifications when the peer
+  // refuses to negotiate an MTU larger than the 23-byte default (20 usable
+  // payload bytes) — and one JSON frame is far bigger than that. Parsing each
+  // notification in isolation threw a SyntaxError on every single frame and
+  // silently dropped all live data while the UI still showed "Connected", so
+  // accumulate fragments until the buffer parses.
+  let buffer = "";
   const handleNotification = (event) => {
-    try {
-      const text = decoder.decode(event.target.value);
-      const telemetry = JSON.parse(text);
-      onTelemetry && onTelemetry(telemetry);
-    } catch (err) {
-      console.warn("JUST CHILL: failed to parse telemetry payload", err);
+    buffer += decoder.decode(event.target.value);
+
+    // The firmware marks the end of a frame with a newline; if it doesn't,
+    // fall back to trying the buffer as-is on every fragment.
+    const parts = buffer.split("\n");
+    buffer = parts.pop();
+    for (const part of parts) {
+      const text = part.trim();
+      if (!text) continue;
+      try {
+        onTelemetry && onTelemetry(JSON.parse(text));
+      } catch (err) {
+        console.warn("JUST CHILL: dropped an unparseable telemetry frame", text, err);
+      }
+    }
+
+    if (buffer.length) {
+      try {
+        const telemetry = JSON.parse(buffer);
+        buffer = "";
+        onTelemetry && onTelemetry(telemetry);
+      } catch {
+        // Still mid-frame — keep accumulating. Guard against an unterminated
+        // frame growing without bound if the firmware sends garbage.
+        if (buffer.length > 4096) buffer = "";
+      }
     }
   };
   telemetryChar.addEventListener("characteristicvaluechanged", handleNotification);
 
+  // A GATT write started while another is still in flight is rejected with
+  // "GATT operation already in progress". Dragging a slider fires a change per
+  // pixel, so writes are serialised through one chain and superseded commands
+  // are dropped — only the newest pending value is ever sent, and it always
+  // wins, instead of the jacket being left on a stale mid-drag value.
+  let inFlight = Promise.resolve();
+  let queued = null;
   async function sendCommand(command) {
-    const encoder = new TextEncoder();
-    const payload = encoder.encode(JSON.stringify(command));
-    // BLE writes are capped (typically ~20 bytes on older stacks, more with
-    // negotiated MTU). Keep JacketCommand small — it's five short fields.
-    await commandChar.writeValue(payload);
+    queued = command;
+    const run = inFlight.then(async () => {
+      const next = queued;
+      if (next === null) return;
+      queued = null;
+      const payload = new TextEncoder().encode(JSON.stringify(next));
+      // writeValueWithResponse where available: it waits for the peer to ack,
+      // which is what keeps the queue honest. Older stacks only have writeValue.
+      if (commandChar.writeValueWithResponse) await commandChar.writeValueWithResponse(payload);
+      else await commandChar.writeValue(payload);
+    }).catch((err) => {
+      console.warn("JUST CHILL: command write failed", err);
+    });
+    inFlight = run;
+    return run;
   }
 
   function disconnect() {
+    queued = null;
     telemetryChar.removeEventListener("characteristicvaluechanged", handleNotification);
+    device.removeEventListener("gattserverdisconnected", handleGattDisconnected);
+    telemetryChar.stopNotifications().catch(() => {});
     if (device.gatt.connected) device.gatt.disconnect();
   }
 
